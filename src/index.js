@@ -194,42 +194,36 @@ function connectTwitch() {
     "[Twitch] Connexion au WebSocket…"
   );
 
-  twitchSocket = new WebSocket(
+  const socket = new WebSocket(
     "wss://irc-ws.chat.twitch.tv:443"
   );
 
-  twitchSocket.on("open", () => {
+  twitchSocket = socket;
+
+  socket.on("open", () => {
     console.log(
       "[Twitch] Connexion établie."
     );
 
-    twitchSocket.send(
-      `PASS ${twitchToken}`
-    );
+    socket.send(`PASS ${twitchToken}`);
+    socket.send(`NICK ${twitchUsername}`);
 
-    twitchSocket.send(
-      `NICK ${twitchUsername}`
-    );
-
-    twitchSocket.send(
+    socket.send(
       "CAP REQ :twitch.tv/tags " +
       "twitch.tv/commands " +
       "twitch.tv/membership"
     );
 
     for (const channel of channels) {
-      twitchSocket.send(
-        `JOIN #${channel}`
-      );
+      socket.send(`JOIN #${channel}`);
     }
 
     console.log(
-      `[Twitch] Chaînes : ${channels.join(", ")
-      }`
+      `[Twitch] Chaînes : ${channels.join(", ")}`
     );
   });
 
-  twitchSocket.on("message", data => {
+  socket.on("message", data => {
     const lines =
       data.toString().split("\r\n");
 
@@ -248,86 +242,47 @@ function connectTwitch() {
         );
       }
 
-      if (line === "RECONNECT") {
+      if (
+        line === "RECONNECT" ||
+        line.endsWith(" RECONNECT")
+      ) {
         console.log(
           "[Twitch] Reconnexion demandée."
         );
 
-        twitchSocket.close();
-        continue;
+        socket.close();
+        return;
       }
 
       handleTwitchLine(line);
     }
   });
 
-  twitchSocket.on("error", error => {
+  socket.on("error", error => {
     console.error(
       "[Twitch] Erreur :",
-      error
+      error.message || error
     );
   });
 
-  twitchSocket.on(
-    "close",
-    (code, reason) => {
-      console.log(
-        "[Twitch] Déconnexion.",
-        {
-          code,
-          reason: reason.toString() || "Aucune raison"
-        }
-      );
-
-      scheduleReconnect();
+  socket.on("close", (code, reason) => {
+    if (twitchSocket === socket) {
+      twitchSocket = null;
     }
-  );
-}
 
-let buffer = "";
-
-twitchSocket.on(
-  "data",
-  data => {
-    buffer += data.toString();
-
-    const lines =
-      buffer.split("\r\n");
-
-    buffer =
-      lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (line) {
-        handleTwitchLine(line);
-      }
-    }
-  }
-);
-
-twitchSocket.on(
-  "error",
-  error => {
-    console.error(
-      "[Twitch] Erreur :",
-      error.message
-    );
-  }
-);
-
-twitchSocket.on(
-  "close",
-  () => {
     console.log(
-      "[Twitch] Déconnexion. Reconnexion dans 5 secondes."
+      "[Twitch] Déconnexion.",
+      {
+        code,
+        reason:
+          reason.toString() ||
+          "Aucune raison"
+      }
     );
 
-    setTimeout(
-      connectTwitch,
-      5000
-    );
-  }
-);
+    scheduleReconnect();
+  });
+}
 
 function printStats() {
   console.log(
