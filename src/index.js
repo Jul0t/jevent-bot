@@ -1,4 +1,5 @@
 import tls from "node:tls";
+import WebSocket from "ws";
 import {
   Client,
   GatewayIntentBits
@@ -126,9 +127,14 @@ function parseTags(value) {
 
 function handleTwitchLine(line) {
   if (line === "PING :tmi.twitch.tv") {
-    twitchSocket?.write(
-      "PONG :tmi.twitch.tv\r\n"
-    );
+    if (
+      twitchSocket?.readyState ===
+      WebSocket.OPEN
+    ) {
+      twitchSocket.send(
+        "PONG :tmi.twitch.tv"
+      );
+    }
 
     return;
   }
@@ -166,88 +172,162 @@ function handleTwitchLine(line) {
 }
 
 let twitchSocket = null;
+let reconnectTimer = null;
+
+function scheduleReconnect() {
+  if (reconnectTimer) {
+    return;
+  }
+
+  console.log(
+    "[Twitch] Reconnexion dans 5 secondes."
+  );
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectTwitch();
+  }, 5000);
+}
 
 function connectTwitch() {
-  twitchSocket = tls.connect({
-    host: "irc.chat.twitch.tv",
-    port: 6697,
-    servername: "irc.chat.twitch.tv",
-    rejectUnauthorized: true
-  }, () => {
+  console.log(
+    "[Twitch] Connexion au WebSocket…"
+  );
+
+  twitchSocket = new WebSocket(
+    "wss://irc-ws.chat.twitch.tv:443"
+  );
+
+  twitchSocket.on("open", () => {
     console.log(
       "[Twitch] Connexion établie."
     );
 
-    twitchSocket.write(
-      `PASS ${twitchToken}\r\n`
+    twitchSocket.send(
+      `PASS ${twitchToken}`
     );
 
-    twitchSocket.write(
-      `NICK ${twitchUsername}\r\n`
+    twitchSocket.send(
+      `NICK ${twitchUsername}`
     );
 
-    twitchSocket.write(
+    twitchSocket.send(
       "CAP REQ :twitch.tv/tags " +
-      "twitch.tv/commands\r\n"
+      "twitch.tv/commands " +
+      "twitch.tv/membership"
     );
 
     for (const channel of channels) {
-      twitchSocket.write(
-        `JOIN #${channel}\r\n`
+      twitchSocket.send(
+        `JOIN #${channel}`
       );
     }
 
     console.log(
-      `[Twitch] Chaînes : ${channels.join(", ")}`
+      `[Twitch] Chaînes : ${channels.join(", ")
+      }`
     );
-  }
-  );
+  });
 
-  let buffer = "";
+  twitchSocket.on("message", data => {
+    const lines =
+      data.toString().split("\r\n");
 
-  twitchSocket.on(
-    "data",
-    data => {
-      buffer += data.toString();
-
-      const lines =
-        buffer.split("\r\n");
-
-      buffer =
-        lines.pop() ?? "";
-
-      for (const line of lines) {
-        if (line) {
-          handleTwitchLine(line);
-        }
+    for (const line of lines) {
+      if (!line) {
+        continue;
       }
-    }
-  );
 
-  twitchSocket.on(
-    "error",
-    error => {
-      console.error(
-        "[Twitch] Erreur :",
-        error.message
-      );
+      if (
+        line.includes("NOTICE") ||
+        line.includes("ERROR")
+      ) {
+        console.log(
+          "[Twitch IRC]",
+          line
+        );
+      }
+
+      if (line === "RECONNECT") {
+        console.log(
+          "[Twitch] Reconnexion demandée."
+        );
+
+        twitchSocket.close();
+        continue;
+      }
+
+      handleTwitchLine(line);
     }
-  );
+  });
+
+  twitchSocket.on("error", error => {
+    console.error(
+      "[Twitch] Erreur :",
+      error
+    );
+  });
 
   twitchSocket.on(
     "close",
-    () => {
+    (code, reason) => {
       console.log(
-        "[Twitch] Déconnexion. Reconnexion dans 5 secondes."
+        "[Twitch] Déconnexion.",
+        {
+          code,
+          reason: reason.toString() || "Aucune raison"
+        }
       );
 
-      setTimeout(
-        connectTwitch,
-        5000
-      );
+      scheduleReconnect();
     }
   );
 }
+
+let buffer = "";
+
+twitchSocket.on(
+  "data",
+  data => {
+    buffer += data.toString();
+
+    const lines =
+      buffer.split("\r\n");
+
+    buffer =
+      lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (line) {
+        handleTwitchLine(line);
+      }
+    }
+  }
+);
+
+twitchSocket.on(
+  "error",
+  error => {
+    console.error(
+      "[Twitch] Erreur :",
+      error.message
+    );
+  }
+);
+
+twitchSocket.on(
+  "close",
+  () => {
+    console.log(
+      "[Twitch] Déconnexion. Reconnexion dans 5 secondes."
+    );
+
+    setTimeout(
+      connectTwitch,
+      5000
+    );
+  }
+);
 
 function printStats() {
   console.log(
