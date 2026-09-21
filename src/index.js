@@ -296,7 +296,18 @@ function printStats() {
 connectTwitch();
 
 setInterval(
-  printStats,
+  async () => {
+    printStats();
+
+    try {
+      await sendStats();
+    } catch (error) {
+      console.error(
+        "[API] Envoi impossible :",
+        error.message
+      );
+    }
+  },
   60_000
 );
 
@@ -324,4 +335,41 @@ if (process.env.DISCORD_TOKEN) {
   discord.login(
     process.env.DISCORD_TOKEN
   );
+}
+
+async function sendStats() {
+  const rows = [...stats.values()];
+
+  if (rows.length === 0) {
+    return;
+  }
+
+  const response = await fetch(
+    `${process.env.JEVENT_API_URL}/api/internal/twitch/stats`,
+    {
+      method: "POST",
+      headers: {
+        Authorization:
+          `Bearer ${process.env.JEVENT_BOT_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        stats: rows
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+
+    throw new Error(
+      `HTTP ${response.status} — ${body}`
+    );
+  }
+
+  console.log(
+    `[API] ${rows.length} statistique(s) envoyée(s).`
+  );
+
+  stats.clear();
 }
