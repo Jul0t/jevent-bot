@@ -1,5 +1,5 @@
-import tls from "node:tls";
 import WebSocket from "ws";
+
 import {
   Client,
   GatewayIntentBits
@@ -11,15 +11,26 @@ const twitchUsername =
 const twitchToken =
   process.env.TWITCH_BOT_OAUTH_TOKEN;
 
-const channels =
+const apiBaseUrl =
   String(
-    process.env.TWITCH_CHANNELS ?? ""
-  )
-    .split(",")
-    .map(channel =>
-      channel.trim().toLowerCase()
+    process.env.JEVENT_API_URL ?? ""
+  ).replace(/\/+$/, "");
+
+const botApiToken =
+  process.env.JEVENT_BOT_TOKEN;
+
+const fallbackChannels = [
+  ...new Set(
+    String(
+      process.env.TWITCH_CHANNELS ?? ""
     )
-    .filter(Boolean);
+      .split(",")
+      .map(channel =>
+        channel.trim().toLowerCase()
+      )
+      .filter(Boolean)
+  )
+];
 
 if (!twitchUsername || !twitchToken) {
   throw new Error(
@@ -27,11 +38,14 @@ if (!twitchUsername || !twitchToken) {
   );
 }
 
-if (channels.length === 0) {
-  throw new Error(
-    "TWITCH_CHANNELS est vide."
-  );
-}
+let desiredChannels =
+  new Set(fallbackChannels);
+
+let joinedChannels =
+  new Set();
+
+let twitchSocket = null;
+let reconnectTimer = null;
 
 const stats = new Map();
 
@@ -47,28 +61,33 @@ function getDateKey() {
       }
     ).formatToParts(new Date());
 
-  const values = Object.fromEntries(
-    parts
-      .filter(part =>
-        part.type !== "literal"
-      )
-      .map(part => [
-        part.type,
-        part.value
-      ])
-  );
+  const values =
+    Object.fromEntries(
+      parts
+        .filter(part =>
+          part.type !== "literal"
+        )
+        .map(part => [
+          part.type,
+          part.value
+        ])
+    );
 
-  return `${values.year}-${values.month}-${values.day}`;
+  return (
+    `${values.year}-` +
+    `${values.month}-` +
+    `${values.day}`
+  );
 }
 
 function getChannelStats(channel) {
-  const key =
-    `${channel}:${getDateKey()}`;
+  const date = getDateKey();
+  const key = `${channel}:${date}`;
 
   if (!stats.has(key)) {
     stats.set(key, {
       channel,
-      date: getDateKey(),
+      date,
       messages: 0,
       emotes: 0
     });
@@ -79,7 +98,9 @@ function getChannelStats(channel) {
 
 function countEmotes(tags) {
   const emotes =
-    tags.match(/emotes=([^;]*)/)?.[1] ?? "";
+    tags.match(
+      /emotes=([^;]*)/
+    )?.[1] ?? "";
 
   if (!emotes) {
     return 0;
@@ -87,29 +108,38 @@ function countEmotes(tags) {
 
   return emotes
     .split("/")
-    .reduce((total, group) => {
-      const separator =
-        group.indexOf(":");
+    .reduce(
+      (total, group) => {
+        const separator =
+          group.indexOf(":");
 
-      if (separator === -1) {
-        return total;
-      }
+        if (separator === -1) {
+          return total;
+        }
 
-      const positions =
-        group.slice(separator + 1);
+        const positions =
+          group.slice(
+            separator + 1
+          );
 
-      return total +
-        positions
-          .split(",")
-          .filter(Boolean)
-          .length;
-    }, 0);
+        return (
+          total +
+          positions
+            .split(",")
+            .filter(Boolean)
+            .length
+        );
+      },
+      0
+    );
 }
 
 function parseTags(value) {
   const tags = {};
 
-  for (const item of value.split(";")) {
+  for (
+    const item of value.split(";")
+  ) {
     const separator =
       item.indexOf("=");
 
@@ -118,7 +148,9 @@ function parseTags(value) {
       continue;
     }
 
-    tags[item.slice(0, separator)] =
+    tags[
+      item.slice(0, separator)
+    ] =
       item.slice(separator + 1);
   }
 
@@ -126,7 +158,10 @@ function parseTags(value) {
 }
 
 function handleTwitchLine(line) {
-  if (line === "PING :tmi.twitch.tv") {
+  if (
+    line ===
+    "PING :tmi.twitch.tv"
+  ) {
     if (
       twitchSocket?.readyState ===
       WebSocket.OPEN
@@ -154,25 +189,174 @@ function handleTwitchLine(line) {
   const channel =
     match[3].toLowerCase();
 
-  const message =
-    match[4];
+  const message = match[4];
 
   const channelStats =
     getChannelStats(channel);
 
   channelStats.messages += 1;
+
   channelStats.emotes +=
     countEmotes(match[1] ?? "");
 
   console.log(
     `[Twitch] #${channel} ` +
     `${tags["display-name"] ?? "?"}: ` +
-    `${message}`
+    message
   );
 }
 
-let twitchSocket = null;
-let reconnectTimer = null;
+function normalizeChannels(values) {
+  if (!Array.isArray(values)) {
+    return [];
+  }
+
+  return [
+    ...new Set(
+      values
+        .map(channel =>
+          String(channel)
+            .trim()
+            .toLowerCase()
+        )
+        .filter(Boolean)
+    )
+  ];
+}
+
+function synchronizeTwitchChannels() {
+  const socket = twitchSocket;
+
+  if (
+    !socket ||
+    socket.readyState !==
+      WebSocket.OPEN
+  ) {
+    return;
+  }
+
+  for (
+    const channel of [
+      ...joinedChannels
+    ]
+  ) {
+    if (
+      desiredChannels.has(channel)
+    ) {
+      continue;
+    }
+
+    socket.send(
+      `PART #${channel}`
+    );
+
+    joinedChannels.delete(
+      channel
+    );
+
+    console.log(
+      `[Twitch] Canal quitté : ${channel}`
+    );
+  }
+
+  for (
+    const channel of desiredChannels
+  ) {
+    if (
+      joinedChannels.has(channel)
+    ) {
+      continue;
+    }
+
+    socket.send(
+      `JOIN #${channel}`
+    );
+
+    joinedChannels.add(
+      channel
+    );
+
+    console.log(
+      `[Twitch] Canal rejoint : ${channel}`
+    );
+  }
+
+  console.log(
+    "[Twitch] Chaînes actives :",
+    [...desiredChannels].join(", ") ||
+      "aucune"
+  );
+}
+
+async function refreshTwitchChannels() {
+  if (!apiBaseUrl || !botApiToken) {
+    console.warn(
+      "[Twitch] Synchronisation API désactivée : " +
+      "JEVENT_API_URL ou JEVENT_BOT_TOKEN manque."
+    );
+
+    return;
+  }
+
+  try {
+    const response = await fetch(
+      `${apiBaseUrl}/api/internal/twitch/channels`,
+      {
+        headers: {
+          Authorization:
+            `Bearer ${botApiToken}`
+        }
+      }
+    );
+
+    if (!response.ok) {
+      const body =
+        await response.text();
+
+      throw new Error(
+        `HTTP ${response.status} — ${body}`
+      );
+    }
+
+    const data =
+      await response.json();
+
+    if (
+      !Array.isArray(
+        data.channels
+      )
+    ) {
+      throw new Error(
+        "La réponse ne contient pas de liste de chaînes."
+      );
+    }
+
+    desiredChannels =
+      new Set(
+        normalizeChannels(
+          data.channels
+        )
+      );
+
+    synchronizeTwitchChannels();
+
+    console.log(
+      "[Twitch] Liste API actualisée :",
+      [...desiredChannels]
+        .join(", ") ||
+        "aucune chaîne"
+    );
+  } catch (error) {
+    console.error(
+      "[Twitch] Impossible d’actualiser les chaînes :",
+      error.message || error
+    );
+
+    console.log(
+      "[Twitch] Conservation de la liste précédente."
+    );
+  }
+}
 
 function scheduleReconnect() {
   if (reconnectTimer) {
@@ -183,10 +367,14 @@ function scheduleReconnect() {
     "[Twitch] Reconnexion dans 5 secondes."
   );
 
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectTwitch();
-  }, 5000);
+  reconnectTimer =
+    setTimeout(
+      () => {
+        reconnectTimer = null;
+        connectTwitch();
+      },
+      5000
+    );
 }
 
 function connectTwitch() {
@@ -194,94 +382,116 @@ function connectTwitch() {
     "[Twitch] Connexion au WebSocket…"
   );
 
-  const socket = new WebSocket(
-    "wss://irc-ws.chat.twitch.tv:443"
-  );
+  const socket =
+    new WebSocket(
+      "wss://irc-ws.chat.twitch.tv:443"
+    );
 
   twitchSocket = socket;
 
-  socket.on("open", () => {
-    console.log(
-      "[Twitch] Connexion établie."
-    );
+  socket.on(
+    "open",
+    () => {
+      console.log(
+        "[Twitch] Connexion établie."
+      );
 
-    socket.send(`PASS ${twitchToken}`);
-    socket.send(`NICK ${twitchUsername}`);
+      socket.send(
+        `PASS ${twitchToken}`
+      );
 
-    socket.send(
-      "CAP REQ :twitch.tv/tags " +
-      "twitch.tv/commands " +
-      "twitch.tv/membership"
-    );
+      socket.send(
+        `NICK ${twitchUsername}`
+      );
 
-    for (const channel of channels) {
-      socket.send(`JOIN #${channel}`);
+      socket.send(
+        "CAP REQ :twitch.tv/tags " +
+        "twitch.tv/commands " +
+        "twitch.tv/membership"
+      );
+
+      joinedChannels.clear();
+
+      synchronizeTwitchChannels();
     }
+  );
 
-    console.log(
-      `[Twitch] Chaînes : ${channels.join(", ")}`
-    );
-  });
+  socket.on(
+    "message",
+    data => {
+      const lines =
+        data
+          .toString()
+          .split("\r\n");
 
-  socket.on("message", data => {
-    const lines =
-      data.toString().split("\r\n");
+      for (const line of lines) {
+        if (!line) {
+          continue;
+        }
 
-    for (const line of lines) {
-      if (!line) {
-        continue;
+        if (
+          line.includes("NOTICE") ||
+          line.includes("ERROR")
+        ) {
+          console.log(
+            "[Twitch IRC]",
+            line
+          );
+        }
+
+        if (
+          line === "RECONNECT" ||
+          line.endsWith(
+            " RECONNECT"
+          )
+        ) {
+          console.log(
+            "[Twitch] Reconnexion demandée."
+          );
+
+          socket.close();
+          return;
+        }
+
+        handleTwitchLine(line);
       }
+    }
+  );
 
+  socket.on(
+    "error",
+    error => {
+      console.error(
+        "[Twitch] Erreur :",
+        error.message || error
+      );
+    }
+  );
+
+  socket.on(
+    "close",
+    (code, reason) => {
       if (
-        line.includes("NOTICE") ||
-        line.includes("ERROR")
+        twitchSocket === socket
       ) {
-        console.log(
-          "[Twitch IRC]",
-          line
-        );
+        twitchSocket = null;
       }
 
-      if (
-        line === "RECONNECT" ||
-        line.endsWith(" RECONNECT")
-      ) {
-        console.log(
-          "[Twitch] Reconnexion demandée."
-        );
+      joinedChannels.clear();
 
-        socket.close();
-        return;
-      }
+      console.log(
+        "[Twitch] Déconnexion.",
+        {
+          code,
+          reason:
+            reason.toString() ||
+            "Aucune raison"
+        }
+      );
 
-      handleTwitchLine(line);
+      scheduleReconnect();
     }
-  });
-
-  socket.on("error", error => {
-    console.error(
-      "[Twitch] Erreur :",
-      error.message || error
-    );
-  });
-
-  socket.on("close", (code, reason) => {
-    if (twitchSocket === socket) {
-      twitchSocket = null;
-    }
-
-    console.log(
-      "[Twitch] Déconnexion.",
-      {
-        code,
-        reason:
-          reason.toString() ||
-          "Aucune raison"
-      }
-    );
-
-    scheduleReconnect();
-  });
+  );
 }
 
 function printStats() {
@@ -293,7 +503,69 @@ function printStats() {
   );
 }
 
+async function sendStats() {
+  const rows =
+    [...stats.values()];
+
+  if (rows.length === 0) {
+    return;
+  }
+
+  if (!apiBaseUrl || !botApiToken) {
+    throw new Error(
+      "JEVENT_API_URL ou JEVENT_BOT_TOKEN manque."
+    );
+  }
+
+  const response = await fetch(
+    `${apiBaseUrl}/api/internal/twitch/stats`,
+    {
+      method: "POST",
+
+      headers: {
+        Authorization:
+          `Bearer ${botApiToken}`,
+
+        "Content-Type":
+          "application/json"
+      },
+
+      body: JSON.stringify({
+        stats: rows
+      })
+    }
+  );
+
+  if (!response.ok) {
+    const body =
+      await response.text();
+
+    throw new Error(
+      `HTTP ${response.status} — ${body}`
+    );
+  }
+
+  console.log(
+    `[API] ${rows.length} statistique(s) envoyée(s).`
+  );
+
+  stats.clear();
+}
+
+/*
+ * Démarrage
+ */
+
+await refreshTwitchChannels();
+
 connectTwitch();
+
+setInterval(
+  () => {
+    void refreshTwitchChannels();
+  },
+  60_000
+);
 
 setInterval(
   async () => {
@@ -304,7 +576,7 @@ setInterval(
     } catch (error) {
       console.error(
         "[API] Envoi impossible :",
-        error.message
+        error.message || error
       );
     }
   },
@@ -312,9 +584,9 @@ setInterval(
 );
 
 /*
- * Le bot Discord reste optionnel pour le moment.
- * Si DISCORD_TOKEN est configuré, il se connecte.
+ * Le bot Discord reste optionnel.
  */
+
 if (process.env.DISCORD_TOKEN) {
   const discord =
     new Client({
@@ -335,41 +607,4 @@ if (process.env.DISCORD_TOKEN) {
   discord.login(
     process.env.DISCORD_TOKEN
   );
-}
-
-async function sendStats() {
-  const rows = [...stats.values()];
-
-  if (rows.length === 0) {
-    return;
-  }
-
-  const response = await fetch(
-    `${process.env.JEVENT_API_URL}/api/internal/twitch/stats`,
-    {
-      method: "POST",
-      headers: {
-        Authorization:
-          `Bearer ${process.env.JEVENT_BOT_TOKEN}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        stats: rows
-      })
-    }
-  );
-
-  if (!response.ok) {
-    const body = await response.text();
-
-    throw new Error(
-      `HTTP ${response.status} — ${body}`
-    );
-  }
-
-  console.log(
-    `[API] ${rows.length} statistique(s) envoyée(s).`
-  );
-
-  stats.clear();
 }
