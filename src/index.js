@@ -49,6 +49,14 @@ let reconnectTimer = null;
 
 const stats = new Map();
 
+const viewerStats = new Map();
+
+let liveChannels = new Set();
+
+const statsTestMode =
+  process.env.JEVENT_STATS_TEST_MODE ===
+  "true";
+
 function getDateKey() {
   const parts =
     new Intl.DateTimeFormat(
@@ -94,6 +102,137 @@ function getChannelStats(channel) {
   }
 
   return stats.get(key);
+}
+
+function getParisDateParts(
+  date = new Date()
+) {
+  const parts =
+    new Intl.DateTimeFormat(
+      "en-CA",
+      {
+        timeZone: "Europe/Paris",
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+        hour: "2-digit",
+        hourCycle: "h23"
+      }
+    ).formatToParts(date);
+
+  return Object.fromEntries(
+    parts
+      .filter(part =>
+        part.type !== "literal"
+      )
+      .map(part => [
+        part.type,
+        part.value
+      ])
+  );
+}
+
+function getEventDay(
+  date = new Date()
+) {
+  const parts =
+    getParisDateParts(date);
+
+  const dateKey =
+    `${parts.year}-` +
+    `${parts.month}-` +
+    `${parts.day}`;
+
+  const hour =
+    Number(parts.hour);
+
+  if (
+    dateKey === "2026-10-26" &&
+    hour >= 16
+  ) {
+    return 1;
+  }
+
+  if (
+    dateKey === "2026-10-27"
+  ) {
+    return 2;
+  }
+
+  if (
+    dateKey === "2026-10-28"
+  ) {
+    return 3;
+  }
+
+  if (
+    dateKey === "2026-10-29" &&
+    hour < 4
+  ) {
+    return 3;
+  }
+
+  return null;
+}
+
+function getViewerStats({
+  channel,
+  viewerTwitchId,
+  viewerTwitchLogin,
+  viewerTwitchDisplayName
+}) {
+  const now =
+    new Date();
+
+  const date =
+    getDateKey();
+
+  const key =
+    `${viewerTwitchId}:` +
+    `${channel}:` +
+    `${date}`;
+
+  if (!viewerStats.has(key)) {
+    viewerStats.set(
+      key,
+      {
+        channel,
+        date,
+
+        eventDay:
+          getEventDay(now),
+
+        viewerTwitchId,
+
+        viewerTwitchLogin,
+
+        viewerTwitchDisplayName,
+
+        messages: 0,
+        emotes: 0,
+
+        firstSeenAt:
+          now.toISOString(),
+
+        lastSeenAt:
+          now.toISOString()
+      }
+    );
+  }
+
+  const row =
+    viewerStats.get(key);
+
+  row.viewerTwitchLogin =
+    viewerTwitchLogin;
+
+  row.viewerTwitchDisplayName =
+    viewerTwitchDisplayName;
+
+  row.lastSeenAt =
+    now.toISOString();
+
+  return row;
 }
 
 function countEmotes(tags) {
@@ -204,6 +343,79 @@ function handleTwitchLine(line) {
     `${tags["display-name"] ?? "?"}: ` +
     message
   );
+
+  /*
+ * Les statistiques personnelles comptent
+ * uniquement lorsque la chaîne est en live.
+ */
+
+  if (
+    !liveChannels.has(channel)
+  ) {
+    return;
+  }
+
+  const viewerTwitchId =
+    String(
+      tags["user-id"] ?? ""
+    ).trim();
+
+  const viewerTwitchLogin =
+    String(
+      tags.login ??
+      match[2]
+        .split("!")[0] ??
+      ""
+    )
+      .trim()
+      .toLowerCase();
+
+  const viewerTwitchDisplayName =
+    String(
+      tags["display-name"] ??
+      viewerTwitchLogin
+    ).trim();
+
+  /*
+   * Ignore les messages du bot lui-même.
+   */
+
+  if (
+    !viewerTwitchId ||
+    viewerTwitchLogin ===
+    twitchUsername.toLowerCase()
+  ) {
+    return;
+  }
+
+  const eventDay =
+    getEventDay();
+
+  /*
+   * En dehors de l’événement, les données ne
+   * sont enregistrées que lorsque le mode de
+   * test est activé.
+   */
+
+  if (
+    eventDay === null &&
+    !statsTestMode
+  ) {
+    return;
+  }
+
+  const viewerRow =
+    getViewerStats({
+      channel,
+      viewerTwitchId,
+      viewerTwitchLogin,
+      viewerTwitchDisplayName
+    });
+
+  viewerRow.messages += 1;
+
+  viewerRow.emotes +=
+    countEmotes(match[1] ?? "");
 }
 
 function normalizeChannels(values) {
@@ -230,7 +442,7 @@ function synchronizeTwitchChannels() {
   if (
     !socket ||
     socket.readyState !==
-      WebSocket.OPEN
+    WebSocket.OPEN
   ) {
     return;
   }
@@ -284,7 +496,7 @@ function synchronizeTwitchChannels() {
   console.log(
     "[Twitch] Chaînes actives :",
     [...desiredChannels].join(", ") ||
-      "aucune"
+    "aucune"
   );
 }
 
@@ -321,6 +533,50 @@ async function refreshTwitchChannels() {
     const data =
       await response.json();
 
+    const creatorsResponse =
+      await fetch(
+        `${apiBaseUrl}/api/creators`,
+        {
+          headers: {
+            Accept: "application/json"
+          }
+        }
+      );
+
+    if (creatorsResponse.ok) {
+      const creatorsData =
+        await creatorsResponse.json();
+
+      const creators =
+        Array.isArray(
+          creatorsData?.creators
+        )
+          ? creatorsData.creators
+          : [];
+
+      liveChannels =
+        new Set(
+          creators
+            .filter(creator =>
+              Boolean(creator.isLive)
+            )
+            .map(creator =>
+              String(
+                creator.twitchLogin ?? ""
+              )
+                .trim()
+                .toLowerCase()
+            )
+            .filter(Boolean)
+        );
+
+      console.log(
+        "[Twitch] Chaînes en direct :",
+        [...liveChannels].join(", ") ||
+        "aucune"
+      );
+    }
+
     if (
       !Array.isArray(
         data.channels
@@ -344,7 +600,7 @@ async function refreshTwitchChannels() {
       "[Twitch] Liste API actualisée :",
       [...desiredChannels]
         .join(", ") ||
-        "aucune chaîne"
+      "aucune chaîne"
     );
   } catch (error) {
     console.error(
@@ -552,6 +808,57 @@ async function sendStats() {
   stats.clear();
 }
 
+async function sendViewerStats() {
+  const rows =
+    [...viewerStats.values()];
+
+  if (rows.length === 0) {
+    return;
+  }
+
+  if (!apiBaseUrl || !botApiToken) {
+    throw new Error(
+      "JEVENT_API_URL ou JEVENT_BOT_TOKEN manque."
+    );
+  }
+
+  const response = await fetch(
+    `${apiBaseUrl}/api/internal/twitch/viewer-stats`,
+    {
+      method: "POST",
+
+      headers: {
+        Authorization:
+          `Bearer ${botApiToken}`,
+
+        "Content-Type":
+          "application/json"
+      },
+
+      body: JSON.stringify({
+        stats: rows
+      })
+    }
+  );
+
+  const responseText =
+    await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `HTTP ${response.status} — ` +
+      responseText
+    );
+  }
+
+  console.log(
+    `[API] ${rows.length} ` +
+    "statistique(s) viewer envoyée(s)."
+  );
+
+  viewerStats.clear();
+}
+
 /*
  * Démarrage
  */
@@ -573,6 +880,7 @@ setInterval(
 
     try {
       await sendStats();
+      await sendViewerStats();
     } catch (error) {
       console.error(
         "[API] Envoi impossible :",
