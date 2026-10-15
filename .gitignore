@@ -1,3 +1,4 @@
 node_modules/
 jevent-bot.code-workspace
 .env
+api-jevent/
